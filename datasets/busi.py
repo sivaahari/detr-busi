@@ -1,6 +1,7 @@
 import os
 import cv2
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 class BUSIDataset(Dataset):
@@ -26,9 +27,31 @@ class BUSIDataset(Dataset):
         
         image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        
+
+        # resize for memory safety
+        image = cv2.resize(image, (256, 256))
+        mask = cv2.resize(mask, (256, 256))
+
         bbox = self.mask_to_bbox(mask)
-        
+
+        # normalize image
+        image = image / 255.0
+
+        # EDGE MAP (Sobel)
+        sobelx = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+        edges = np.sqrt(sobelx**2 + sobely**2)
+
+        # normalize edges
+        edges = (edges - edges.min()) / (edges.max() - edges.min() + 1e-6)
+
+        # stack channels → (2, H, W)
+        image = np.stack([image, edges], axis=0)
+
+        image = torch.tensor(image, dtype=torch.float32)
+        bbox = torch.tensor(bbox, dtype=torch.float32)
+        label = torch.tensor(label, dtype=torch.long)
+
         return image, bbox, label
 
     def mask_to_bbox(self, mask):
