@@ -22,7 +22,7 @@ def train():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    epochs = 3
+    epochs = 30
 
     for epoch in range(epochs):
         model.train()
