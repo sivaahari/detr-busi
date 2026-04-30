@@ -4,7 +4,7 @@ import torchvision.models as models
 
 
 class DETR(nn.Module):
-    def __init__(self, num_classes=2, num_queries=100):
+    def __init__(self, num_classes=3, num_queries=100):
         super().__init__()
 
         # -------- Backbone --------
@@ -37,6 +37,7 @@ class DETR(nn.Module):
 
         # -------- Prediction Heads --------
         self.class_embed = nn.Linear(hidden_dim, num_classes)
+
         self.bbox_embed = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -61,7 +62,7 @@ class DETR(nn.Module):
         hs = self.transformer(features, queries)
 
         # Predictions
-        class_logits = self.class_embed(hs)
-        bbox = self.bbox_embed(hs)
+        class_logits = self.class_embed(hs)  # (B, 100, 3)
+        bbox = self.bbox_embed(hs)          # (B, 100, 4)
 
         return class_logits, bbox
