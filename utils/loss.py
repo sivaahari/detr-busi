@@ -28,7 +28,7 @@ class DETRLoss:
             tgt_labels = target["labels"][idx_tgt]
             tgt_boxes = target["boxes"][idx_tgt]
 
-            # -------- CLASSIFICATION --------
+            # classification
             target_classes = torch.full(
                 (logits.shape[0],), 2, dtype=torch.long, device=logits.device
             )
@@ -36,19 +36,17 @@ class DETRLoss:
 
             cls_loss = F.cross_entropy(logits, target_classes)
 
-            # -------- BBOX LOSS --------
+            # bbox
             matched_boxes = boxes[idx_pred]
             bbox_loss = F.l1_loss(matched_boxes, tgt_boxes)
 
-            # -------- GEOMETRIC PRIOR LOSS --------
-            # width & height
+            # geometric prior
             pred_w = matched_boxes[:, 2] - matched_boxes[:, 0]
             pred_h = matched_boxes[:, 3] - matched_boxes[:, 1]
 
             tgt_w = tgt_boxes[:, 2] - tgt_boxes[:, 0]
             tgt_h = tgt_boxes[:, 3] - tgt_boxes[:, 1]
 
-            # aspect ratio
             pred_ratio = pred_h / (pred_w + 1e-6)
             tgt_ratio = tgt_h / (tgt_w + 1e-6)
 

@@ -10,10 +10,9 @@ def visualize_prediction(image, pred_logits, pred_boxes):
 
     probs = torch.softmax(pred_logits, dim=-1)
 
-    # ignore no-object class
+    # Ignore no-object class
     scores, classes = probs[:, :2].max(dim=1)
 
-    # pick BEST prediction only
     best_idx = torch.argmax(scores)
 
     cls = classes[best_idx].item()
