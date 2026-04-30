@@ -13,7 +13,7 @@ def train():
     dataset = BUSIDataset("data/BUSI")
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 
-    # Model (IMPORTANT: 3 classes now)
+    # Model
     model = DETR(num_classes=3).to(device)
 
     # Loss
@@ -22,11 +22,11 @@ def train():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    epochs = 3  # keep small for testing
+    epochs = 3
 
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
+        total_loss = 0.0
 
         loop = tqdm(dataloader)
 
@@ -35,6 +35,7 @@ def train():
             bboxes = bboxes.to(device)
             labels = labels.to(device)
 
+            # Forward pass
             logits, boxes = model(images)
 
             # Prepare targets
@@ -42,18 +43,23 @@ def train():
             for i in range(len(images)):
                 targets.append((bboxes[i], labels[i]))
 
+            # Compute loss
             loss = criterion.loss(logits, boxes, targets)
 
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
 
-            loop.set_description(f"Epoch {epoch+1}")
+            loop.set_description(f"Epoch {epoch + 1}")
             loop.set_postfix(loss=loss.item())
 
-        print(f"Epoch {epoch+1} Loss: {total_loss:.4f}")
+        print(f"Epoch {epoch + 1} Loss: {total_loss:.4f}")
+
+        # Save model after each epoch
+        torch.save(model.state_dict(), "model.pth")
 
 
 if __name__ == "__main__":
