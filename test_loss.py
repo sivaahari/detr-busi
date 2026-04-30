@@ -1,17 +1,14 @@
 import torch
 from models.detr import DETR
 from utils.loss import DETRLoss
+import configs.config as cfg
 
-model = DETR(num_classes=2)
-
+model     = DETR(num_classes=cfg.NUM_CLASSES, num_queries=cfg.NUM_QUERIES)
 criterion = DETRLoss()
 
-# dummy batch
-x = torch.randn(2, 2, 256, 256)
-
+x = torch.randn(2, 2, cfg.IMG_SIZE, cfg.IMG_SIZE)
 logits, boxes = model(x)
 
-# fake targets (1 object per image)
 targets = [
     (torch.tensor([0.2, 0.3, 0.5, 0.6]), torch.tensor(1)),
     (torch.tensor([0.1, 0.2, 0.4, 0.5]), torch.tensor(0)),
@@ -20,3 +17,5 @@ targets = [
 loss = criterion.loss(logits, boxes, targets)
 
 print("Loss:", loss.item())
+assert loss.item() > 0
+print("OK")

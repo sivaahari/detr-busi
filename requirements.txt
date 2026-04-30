@@ -23,6 +23,7 @@ pydantic_core==2.46.3
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
+scikit-learn==1.7.2
 scipy==1.15.3
 simsimd==6.5.16
 six==1.17.0

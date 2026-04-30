@@ -1,65 +1,146 @@
+import os
+import csv
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from datasets.busi import BUSIDataset
 from models.detr import DETR
 from utils.loss import DETRLoss
+from utils.box_ops import compute_iou
 from tqdm import tqdm
+import configs.config as cfg
 
 
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ─── one training epoch ───────────────────────────────────────────────────────
 
-    # Dataset
-    dataset = BUSIDataset("data/BUSI")
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
 
-    # Model
-    model = DETR(num_classes=3).to(device)
+    loop = tqdm(loader, desc="  train", leave=False)
+    for images, bboxes, labels in loop:
+        images = images.to(device)
+        bboxes = bboxes.to(device)
+        labels = labels.to(device)
 
-    # Loss
-    criterion = DETRLoss()
+        logits, boxes = model(images)
+        targets = [(bboxes[i], labels[i]) for i in range(len(images))]
+        loss = criterion.loss(logits, boxes, targets)
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.GRAD_CLIP)
+        optimizer.step()
 
-    epochs = 15
+        total_loss += loss.item()
+        loop.set_postfix(loss=f"{loss.item():.4f}")
 
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
+    return total_loss / len(loader)
 
-        loop = tqdm(dataloader)
 
-        for images, bboxes, labels in loop:
+# ─── validation epoch ─────────────────────────────────────────────────────────
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total_iou  = 0.0
+    n = 0
+
+    with torch.no_grad():
+        for images, bboxes, labels in loader:
             images = images.to(device)
             bboxes = bboxes.to(device)
             labels = labels.to(device)
 
-            # Forward pass
             logits, boxes = model(images)
-
-            # Prepare targets
-            targets = []
-            for i in range(len(images)):
-                targets.append((bboxes[i], labels[i]))
-
-            # Compute loss
+            targets = [(bboxes[i], labels[i]) for i in range(len(images))]
             loss = criterion.loss(logits, boxes, targets)
-
-            # Backpropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
             total_loss += loss.item()
 
-            loop.set_description(f"Epoch {epoch + 1}")
-            loop.set_postfix(loss=loss.item())
+            for i in range(len(images)):
+                probs    = torch.softmax(logits[i], dim=-1)
+                scores   = probs[:, :2].max(dim=1).values
+                best_idx = scores.argmax()
 
-        print(f"Epoch {epoch + 1} Loss: {total_loss:.4f}")
+                pred_box = boxes[i][best_idx].cpu()
+                gt_box   = bboxes[i].cpu()
+                total_iou += compute_iou(pred_box, gt_box)
+                n += 1
 
-        # Save model after each epoch
-        torch.save(model.state_dict(), "model.pth")
+    return total_loss / len(loader), total_iou / max(n, 1)
+
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}\n")
+
+    # ── datasets ──────────────────────────────────────────────────────────────
+    train_set = BUSIDataset(split="train")
+    val_set   = BUSIDataset(split="val")
+    print(f"Train: {len(train_set)}  |  Val: {len(val_set)}\n")
+
+    train_loader = DataLoader(
+        train_set, batch_size=cfg.BATCH_SIZE, shuffle=True,  num_workers=0
+    )
+    val_loader = DataLoader(
+        val_set,   batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=0
+    )
+
+    # ── model / loss / optimizer ───────────────────────────────────────────────
+    model     = DETR(num_classes=cfg.NUM_CLASSES, num_queries=cfg.NUM_QUERIES).to(device)
+    criterion = DETRLoss()
+
+    # Backbone (pre-trained ResNet layers + projections) gets 10x lower LR than
+    # the transformer + heads which are trained from scratch.
+    backbone_names = {"layer1", "layer2", "layer3", "layer4",
+                      "input_proj1", "input_proj2", "input_proj3", "input_proj4",
+                      "fusion_conv"}
+    backbone_params = [p for n, p in model.named_parameters()
+                       if n.split(".")[0] in backbone_names]
+    head_params     = [p for n, p in model.named_parameters()
+                       if n.split(".")[0] not in backbone_names]
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": cfg.LR_BACKBONE},
+            {"params": head_params,     "lr": cfg.LR},
+        ],
+        weight_decay=cfg.WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.EPOCHS
+    )
+
+    # ── logging ───────────────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(cfg.SAVE_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.LOG_PATH),  exist_ok=True)
+
+    log_file = open(cfg.LOG_PATH, "w", newline="")
+    writer   = csv.writer(log_file)
+    writer.writerow(["epoch", "train_loss", "val_loss", "val_miou"])
+
+    best_val_loss = float("inf")
+
+    print(f"{'Epoch':>6}  {'Train Loss':>12}  {'Val Loss':>10}  {'Val mIoU':>10}")
+    print("-" * 46)
+
+    for epoch in range(1, cfg.EPOCHS + 1):
+        train_loss         = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_miou = validate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        print(f"{epoch:>6}  {train_loss:>12.4f}  {val_loss:>10.4f}  {val_miou:>10.4f}")
+        writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_miou:.6f}"])
+        log_file.flush()
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), cfg.SAVE_PATH)
+
+    log_file.close()
+    print(f"\nBest val loss: {best_val_loss:.4f}  →  saved to {cfg.SAVE_PATH}")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,9 @@ class DETR(nn.Module):
         self.input_proj3 = nn.Conv2d(256, hidden_dim, kernel_size=1)
         self.input_proj4 = nn.Conv2d(512, hidden_dim, kernel_size=1)
 
+        # learned fusion: concat 4 scale features → single hidden_dim map
+        self.fusion_conv = nn.Conv2d(hidden_dim * 4, hidden_dim, kernel_size=1)
+
         # ---------------- Positional Encoding ----------------
         self.row_embed = nn.Embedding(256, hidden_dim // 2)
         self.col_embed = nn.Embedding(256, hidden_dim // 2)
@@ -90,14 +93,14 @@ class DETR(nn.Module):
         f3 = F.interpolate(f3, size=target_size, mode="bilinear", align_corners=False)
         f4 = F.interpolate(f4, size=target_size, mode="bilinear", align_corners=False)
 
-        # ---------------- Fuse features ----------------
-        features = f1 + f2 + f3 + f4
+        # ---------------- Fuse features (learned) ----------------
+        features = self.fusion_conv(torch.cat([f1, f2, f3, f4], dim=1))
 
         B, C, H, W = features.shape
 
         # ---------------- Positional Encoding ----------------
-        i = torch.arange(W, device=x.device)
-        j = torch.arange(H, device=x.device)
+        i = torch.arange(W, device=features.device)
+        j = torch.arange(H, device=features.device)
 
         x_emb = self.col_embed(i)
         y_emb = self.row_embed(j)
@@ -114,7 +117,7 @@ class DETR(nn.Module):
 
         # ---------------- Flatten ----------------
         features = features.flatten(2).permute(0, 2, 1)
-        pos = pos.flatten(2).permute(0, 2, 1)
+        pos      = pos.flatten(2).permute(0, 2, 1)
 
         queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
 
@@ -123,6 +126,6 @@ class DETR(nn.Module):
 
         # ---------------- Predictions ----------------
         class_logits = self.class_embed(hs)
-        bbox = self.bbox_embed(hs)
+        bbox         = self.bbox_embed(hs)
 
         return class_logits, bbox
