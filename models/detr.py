@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 
+import configs.config as cfg
+from models.deformable_attention import DeformableEncoder
+
 
 class DETR(nn.Module):
     def __init__(self, num_classes=3, num_queries=100):
@@ -44,13 +47,21 @@ class DETR(nn.Module):
         self.col_embed = nn.Embedding(256, hidden_dim // 2)
 
         # ---------------- Transformer ----------------
-        self.transformer = nn.Transformer(
+        self.encoder = DeformableEncoder(
             d_model=hidden_dim,
-            nhead=8,
-            num_encoder_layers=3,
-            num_decoder_layers=3,
-            dim_feedforward=512,
-            batch_first=True,
+            n_heads=cfg.NHEAD,
+            n_layers=cfg.ENC_LAYERS,
+            n_points=cfg.N_POINTS,
+            dim_ffn=cfg.DIM_FFN,
+        )
+        self.decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                d_model=hidden_dim,
+                nhead=cfg.NHEAD,
+                dim_feedforward=cfg.DIM_FFN,
+                batch_first=True,
+            ),
+            num_layers=cfg.DEC_LAYERS,
         )
 
         # ---------------- Queries ----------------
@@ -119,10 +130,20 @@ class DETR(nn.Module):
         features = features.flatten(2).permute(0, 2, 1)
         pos      = pos.flatten(2).permute(0, 2, 1)
 
-        queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
+        queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
 
-        # ---------------- Transformer ----------------
-        hs = self.transformer(features + pos, queries)
+        # ---------------- Reference points (normalized grid) ----------------
+        col_idx = torch.arange(W, device=features.device).float() / W
+        row_idx = torch.arange(H, device=features.device).float() / H
+        grid_y, grid_x = torch.meshgrid(row_idx, col_idx, indexing="ij")
+        ref_pts = torch.stack([grid_x, grid_y], dim=-1)          # (H, W, 2)
+        ref_pts = ref_pts.flatten(0, 1).unsqueeze(0).expand(B, -1, -1)  # (B, H*W, 2)
+
+        # ---------------- Deformable encoder ----------------
+        memory = self.encoder(features + pos, ref_pts, (H, W))   # (B, H*W, 256)
+
+        # ---------------- Standard decoder ----------------
+        hs = self.decoder(queries, memory)                        # (B, num_queries, 256)
 
         # ---------------- Predictions ----------------
         class_logits = self.class_embed(hs)

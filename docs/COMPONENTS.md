@@ -1,6 +1,6 @@
 # Project Components — Plain English Guide
 
-This document explains every part of the project from the ground up. After reading this, you should be able to explain the whole system to someone without any deep learning background.
+This document explains every part of the project from the ground up — what each component does, why it was designed that way, and how it relates to the original paper.
 
 ---
 
@@ -8,262 +8,370 @@ This document explains every part of the project from the ground up. After readi
 
 We are building a system that looks at a breast ultrasound image and draws a box around any nodule it finds, then labels that nodule as either **benign** (harmless) or **malignant** (potentially cancerous).
 
-The model is called **DETR** — Detection Transformer. The key idea is that instead of scanning the image in many different ways (like older detectors do), DETR reads the whole image at once using a Transformer (the same technology behind ChatGPT) and directly predicts where the nodule is.
+The model is called **DETR** — Detection Transformer. Instead of scanning the image in many overlapping windows (like older detectors), DETR reads the whole image at once using a Transformer and directly predicts where the nodule is and what class it belongs to. There are no pre-defined anchor boxes, and no post-processing step like non-maximum suppression.
+
+The paper this replicates ("Prior-Guided DETR", Wang et al. 2026) proposes three novel modules to handle the specific challenges of ultrasound images: irregular nodule shapes, blurred boundaries, speckle noise, and scale variation. Our implementation approximates all three under a 4 GB VRAM constraint.
 
 ---
 
 ## 1. The Dataset — `datasets/busi.py`
 
-**What it is:** The BUSI (Breast Ultrasound Images) dataset. It contains grayscale ultrasound photos of breasts, paired with segmentation masks — images where the pixels of the nodule are highlighted in white.
+**What it is:** The BUSI (Breast Ultrasound Images) dataset — 780 grayscale ultrasound photographs of breasts, each paired with a segmentation mask (a pixel map where nodule pixels are white).
 
 **What we do with it:**
-- We load each image and its mask
-- From the mask, we find the bounding box (the smallest rectangle that fits around the nodule)
-- We split all images into three groups: **70% for training**, **15% for validation**, **15% for testing**
-- The split is *stratified* — meaning each group has a proportional mix of benign and malignant cases, not accidental imbalance
+- Load each image and its mask
+- Extract the bounding box from the mask: find the smallest rectangle that tightly encloses all white pixels — `[x_min, y_min, x_max, y_max]` — and normalise the coordinates to `[0, 1]`
+- Split into **70% train / 15% val / 15% test** with a fixed random seed
+- The split is *stratified*: each subset has a proportional mix of benign and malignant cases, not an accidental imbalance
 
 **Augmentation (training only):**
-- We randomly flip images left-right and up-down
-- We randomly brighten or darken them
-- We do this to make the model more robust — it should detect nodules regardless of orientation or lighting. The mask gets flipped too so the bounding box stays accurate.
+- Random horizontal and vertical flips
+- Random brightness/contrast adjustment (factor α ∈ [0.8, 1.2], offset β ∈ [−20, 20])
+- The mask is transformed identically so the bounding box remains accurate
 
-**The two-channel input:**
-Instead of feeding just the grayscale image, we also compute a **Sobel edge map** — an image that highlights sharp boundaries and contours. Ultrasound images are blurry and noisy, so edges help the model find nodule boundaries.
-- Channel 0: normalized grayscale image
-- Channel 1: Sobel edge map
+**The two-channel input — approximating the paper's MSFFM:**
 
-Both channels together form a `(2, 256, 256)` tensor (2 images stacked, each 256×256 pixels).
+The paper's MSFFM module extracts structural priors by jointly processing features in the spatial domain (contour, boundary continuity) and the frequency domain (speckle suppression via FFT). Our approximation moves this into the input: instead of a raw grayscale image, we stack a **Sobel edge map** as a second channel.
+
+- Channel 0: normalised grayscale image `∈ [0, 1]`
+- Channel 1: Sobel edge magnitude (highlights nodule boundaries)
+
+This gives the backbone explicit boundary information from the start, approximating the spatial-contour half of MSFFM. The frequency-domain branch (speckle suppression) has no equivalent in this implementation.
+
+Both channels together form a `(2, 256, 256)` tensor per image.
 
 ---
 
 ## 2. The Config — `configs/config.py`
 
-**What it is:** A single file that holds every setting for the entire project — image size, number of epochs, learning rates, file paths, everything.
+A single file holding every hyperparameter for the entire project. Changing a setting here propagates everywhere with no risk of inconsistency.
 
-**Why it matters:** Instead of hardcoded numbers scattered across files, every parameter is defined in one place. To change the batch size, you change one line here.
+Key settings and their rationale:
 
-Key settings:
-- `NUM_CLASSES = 3` — benign, malignant, and "no object" (background)
-- `NUM_QUERIES = 100` — the model makes 100 simultaneous predictions, of which usually only 1 is real
-- `EPOCHS = 50` — how many full passes over the training data
-- `LR = 1e-4` — learning rate for the transformer and prediction heads
-- `LR_BACKBONE = 1e-5` — learning rate for the backbone (10× lower, because it's pre-trained)
-- `NO_OBJ_WEIGHT = 0.1` — how much we penalize the model for getting the 99 "no object" queries wrong
+| Setting | Value | Why |
+|---|---|---|
+| `NUM_CLASSES` | 3 | Benign, malignant, and no-object (background) |
+| `NUM_QUERIES` | 100 | Model makes 100 candidate predictions; only 1 is real. Paper uses 300, but BUSI has 1 nodule per image so 100 suffices |
+| `HIDDEN_DIM` | 256 | Feature dimension throughout the transformer |
+| `NHEAD` | 8 | Number of attention heads |
+| `ENC_LAYERS` | 3 | Deformable encoder depth (paper: 6) |
+| `DEC_LAYERS` | 3 | Standard decoder depth (paper: 6) |
+| `N_POINTS` | 4 | Sampling points per head in deformable attention |
+| `DIM_FFN` | 512 | Feed-forward network hidden dimension |
+| `EPOCHS` | 50 | Full passes over training data (paper: 200) |
+| `BATCH_SIZE` | 4 | Limited by 4 GB VRAM |
+| `LR` | 1e-4 | Learning rate for transformer + prediction heads |
+| `LR_BACKBONE` | 1e-5 | 10× lower for the pre-trained backbone |
+| `WEIGHT_DECAY` | 1e-4 | L2 regularisation |
+| `GRAD_CLIP` | 0.1 | Maximum gradient norm — standard for DETR training |
+| `NO_OBJ_WEIGHT` | 0.1 | Down-weight the 99 no-object queries in the loss |
+| `PRIOR_LOSS_WEIGHT` | 0.5 | Strength of the geometric prior loss term |
+| `IOU_THRESHOLD` | 0.5 | Minimum overlap to count a detection as correct |
 
 ---
 
 ## 3. The Model — `models/detr.py`
 
-This is the brain of the system. It takes in an image and outputs predicted boxes and class labels. It has four main stages:
+The model has four stages. The input is a `(B, 2, 256, 256)` tensor and the output is 100 class predictions and 100 bounding boxes per image.
 
-### Stage 1: The Backbone (ResNet-18)
+### Stage 1: Backbone (ResNet-18)
 
-**What it does:** Extracts features from the image — essentially learning what visual patterns look like.
+ResNet-18 is a convolutional neural network pre-trained on ImageNet. It extracts visual features hierarchically — early layers detect low-level patterns (edges, textures), deeper layers detect high-level semantics (shapes, structures). We use all four stages:
 
-Think of it like this: when you look at an image, your brain first detects simple things (edges, textures) and then builds up to complex things (shapes, objects). ResNet-18 does the same thing across 4 "layers" (called layer1 through layer4).
+| Stage | Channels | Spatial size (256×256 input) | Feature type |
+|---|---|---|---|
+| layer1 | 64 | 64 × 64 | Low-level: edges, local texture |
+| layer2 | 128 | 32 × 32 | Mid-level: shapes, patterns |
+| layer3 | 256 | 16 × 16 | High-level: object parts |
+| layer4 | 512 | 8 × 8 | Semantic: object-level |
 
-- layer1 → low-level features (edges, textures) — spatial size: 64×64
-- layer2 → mid-level features — spatial size: 32×32
-- layer3 → higher-level features — spatial size: 16×16
-- layer4 → high-level semantic features — spatial size: 8×8
+The first convolution of ResNet-18 is modified to accept **2 input channels** (grayscale + Sobel) instead of the standard 3 (RGB). All other pre-trained weights remain intact.
 
-The backbone is **pre-trained** on ImageNet (a huge image dataset), so it already understands visual structure before we even train it on medical images. We modify only the first layer to accept 2 channels instead of 3 (RGB → grayscale+edges).
+The paper uses ResNet-50, which is approximately 2.6× larger in parameter count and has a significantly larger receptive field per block. The paper further embeds its SDFPR module inside every residual block, injecting geometric priors directly into feature extraction. Our backbone has no such modification — geometric priors only appear in the loss function.
 
-### Stage 2: Multi-Scale Fusion (`fusion_conv`)
+### Stage 2: Multi-Scale Fusion
 
-**What it does:** Combines the 4 layers of features into a single rich representation.
+All four feature maps are at different spatial sizes. We merge them into a single representation:
 
-The 4 feature maps are at different spatial sizes (64×64 down to 8×8). We:
-1. Project all 4 to the same number of channels (256) using 1×1 convolutions
-2. Resize all to the same spatial size (64×64)
-3. Concatenate them all together
-4. Pass through a learned 1×1 convolution to mix them into one `(256, 64, 64)` map
+1. Project each to 256 channels using a 1×1 convolution (`input_proj1` through `input_proj4`)
+2. Resize `f2`, `f3`, `f4` up to `f1`'s spatial size (64×64) via bilinear interpolation
+3. Concatenate along the channel dimension: `(B, 1024, 64, 64)`
+4. Pass through a learned 1×1 convolution (`fusion_conv`) to mix and reduce back to `(B, 256, 64, 64)`
 
-**Why not just sum them?** Earlier we were summing, but summing loses information — if two feature maps disagree, they cancel out. Concatenation + learned mixing lets the model decide how to weight each scale.
+The learned mixing step is important: a simple sum would let features cancel out if they disagree. Concatenation + convolution lets the model learn which scale is most informative for each spatial location.
 
-### Stage 3: The Transformer
+This approximates a simplified version of the paper's MSFFM, which operates on only 3 scales but adds the spatial-branch and frequency-branch processing at each scale before fusion.
 
-**What it does:** This is where the magic happens. It lets every part of the image "talk to" every other part simultaneously.
+### Stage 3: Deformable Encoder + Standard Decoder
 
-Think of it like a room full of people where everyone can hear everyone else at once, rather than passing notes one by one (like older RNN models did).
+**Positional encoding:** Learned 2D embeddings (`row_embed`, `col_embed`), concatenated to form a full `(B, H*W, 256)` positional encoding. Added to the feature sequence before encoding. The paper uses fixed sine/cosine encoding; learned embeddings can adapt to the medical domain.
 
-It has two parts:
-- **Encoder:** Reads the entire feature map and lets every spatial location attend to every other. After this, each location knows the global context of the whole image.
-- **Decoder:** Takes 100 learned "object queries" (think of them as 100 detectives, each assigned to look for an object) and has each one attend to the encoder's output to find what it's looking for.
+**Deformable Encoder (`models/deformable_attention.py`):**
 
-The result is 100 output vectors, one per query, each representing a potential detection.
+Standard self-attention has O(N²) complexity — every position attends to every other. For a 64×64 feature map, N = 4096, making O(N²) = ~16.8 million attention pairs. This is what makes vanilla DETR memory-hungry and slow to converge.
+
+Deformable attention replaces this with a small set of K=4 learned sampling points per query. For each query position:
+1. Predict K=4 offsets relative to a reference point on a regular grid
+2. Sample the feature map at those K locations using bilinear interpolation
+3. Compute K learned attention weights (softmax-normalised)
+4. Weighted sum of sampled values → output
+
+Complexity drops from O(N²) to O(N·K). With K=4 and N=4096, that is ~16,384 operations instead of ~16.8 million.
+
+Three such layers (`ENC_LAYERS = 3`) are stacked with pre-norm residual connections. After encoding, each position in the feature sequence encodes global context about the whole image.
+
+The paper uses 6 encoder layers and the same deformable attention mechanism. It also adds the DFI module on top, which aggregates all 6 encoder outputs in a DenseNet-like manner and feeds them to decoder layers in reversed order. Our implementation uses only the final encoder layer output as the decoder's memory — the intermediate layer outputs are discarded. DFI would be the highest-impact addition to close this gap.
+
+**Standard Decoder:**
+
+PyTorch's built-in `nn.TransformerDecoder` with 3 layers. Each layer performs:
+1. Self-attention among the 100 object queries (queries attend to each other)
+2. Cross-attention from queries to the encoder memory (queries attend to image features)
+3. FFN with ReLU
+
+The decoder's cross-attention uses the full encoder memory sequence as Key and Value — this is where queries learn to "look at" the right regions of the image.
 
 ### Stage 4: Prediction Heads
 
-**What they do:** Turn the 100 query vectors into actual predictions.
+Two small networks map the 100 query vectors to predictions:
 
-- **Class head (`class_embed`):** A linear layer that outputs 3 scores per query — probability of being benign, malignant, or no-object
-- **Box head (`bbox_embed`):** A small MLP that outputs 4 numbers per query — `[x_min, y_min, x_max, y_max]` all normalized between 0 and 1. Sigmoid activation ensures the values stay in range.
+- **Class head:** `Linear(256 → 3)` → 3 logit scores per query (benign / malignant / no-object)
+- **Box head:** `Linear(256 → 256) → ReLU → Linear(256 → 4) → Sigmoid` → 4 normalised coordinates `[x_min, y_min, x_max, y_max] ∈ [0, 1]` per query
 
-Final output:
-- `class_logits`: shape `(batch, 100, 3)` — 100 class predictions per image
-- `bbox`: shape `(batch, 100, 4)` — 100 box predictions per image
+Output shapes: `class_logits (B, 100, 3)` and `bbox (B, 100, 4)`.
 
 ---
 
-## 4. The Hungarian Matcher — `utils/matcher.py`
+## 4. Deformable Attention — `models/deformable_attention.py`
 
-**What it does:** Figures out which of the 100 predicted boxes corresponds to the real nodule in the image.
+The deformable attention module (described in Stage 3 above) is implemented in this file. Key implementation details:
 
-This is the core of DETR's loss computation. We have 100 predictions and 1 ground truth — we need to assign the "best" prediction to that ground truth, and label the other 99 as "no object."
+- **Reference points:** A regular grid of (x, y) coordinates covering the full feature map, one per spatial position
+- **Offset prediction:** A linear layer maps each query vector to `K × 2` offset values (K position offsets per head)
+- **Sampling:** `F.grid_sample` with bilinear interpolation at the offset locations
+- **Weight prediction:** Another linear layer maps each query to K softmax attention weights
+- **Output:** Weighted sum of K sampled feature vectors per query
 
-**How it works:**
-1. Compute a cost for every possible pairing: how wrong would it be to say "prediction X corresponds to ground truth Y"?
-   - Cost includes: how wrong the class prediction is + how far off the box location is
-2. Use the **Hungarian Algorithm** (an optimal assignment algorithm) to find the minimum-cost pairing
-
-Think of it like a job assignment problem: you have 100 candidates and 1 job, and you want to find which candidate is the best fit.
+`DeformableEncoderLayer` wraps this in a pre-norm residual block (LayerNorm → attention → residual → LayerNorm → FFN → residual). Three layers are stacked in `DeformableEncoder`.
 
 ---
 
-## 5. The Loss Function — `utils/loss.py`
+## 5. Hungarian Matching — `utils/matcher.py`
 
-**What it does:** Measures how wrong the model is, so the optimizer can improve it.
+We have 100 predictions and 1 ground truth nodule per image. We need to assign exactly one prediction to the ground truth and mark the other 99 as "no object." The Hungarian algorithm does this optimally.
 
-Three components, added together:
+**Cost matrix** (100 × 1 in our single-nodule case):
+
+```
+cost[i] = COST_CLASS × (-log p_class[i]) + COST_BBOX × L1(bbox_pred[i], bbox_gt)
+```
+
+where `COST_CLASS = 1.0` and `COST_BBOX = 5.0` (box localisation matters more than class in the matching step).
+
+`scipy.optimize.linear_sum_assignment` finds the minimum-cost assignment, returning `(pred_idx, gt_idx)` — which query matched which ground truth.
+
+---
+
+## 6. Loss Function — `utils/loss.py`
+
+After matching, the total loss has three components:
 
 ### Classification Loss
-Cross-entropy loss over all 100 queries. For 99 of them, the target is class 2 (no-object). For the 1 matched query, the target is the true class (benign or malignant).
+Cross-entropy over all 100 queries. Target: matched query → true class, all others → no-object (class index 2).
 
-**The class imbalance fix:** Without weighting, the model learns to always predict "no-object" for everything (99% accuracy by doing nothing useful). We down-weight the no-object class by `0.1` so the model is forced to learn to find the real nodule.
+Class weighting vector: `[1.0, 1.0, 0.1]`. Without this, the model would achieve 99% "accuracy" by predicting no-object for everything and never learning to find actual nodules.
+
+The paper uses Focal loss instead, which additionally down-weights easy examples and focuses training on hard ones. Our weighted cross-entropy is a simpler but effective alternative.
 
 ### Bounding Box Loss (L1)
-Simple absolute difference between the predicted box coordinates and the ground-truth box, computed only on the one matched query.
+Applied only to the matched query:
+```
+bbox_loss = L1(pred_box, gt_box)    # element-wise, averaged over 4 coordinates
+```
+The paper additionally uses GIoU loss, which directly penalises non-overlapping area and is more informative when two boxes don't overlap at all. Without GIoU, the model can learn approximate shapes while missing precise localisation — visible in the outputs as boxes that are slightly too large.
 
-### Geometric Prior Loss
-This is our domain knowledge injection. Real breast nodules have predictable shapes — they're roughly oval, not wildly elongated. We penalize predictions that have unrealistic aspect ratios (height/width ratio) or unrealistic widths compared to the ground truth.
+### Geometric Prior Loss — approximating SDFPR
+Applied only to the matched query. Penalises predictions that have unrealistic nodule shapes:
+```
+pred_w = pred_x_max - pred_x_min
+pred_h = pred_y_max - pred_y_min
+gt_w   = gt_x_max - gt_x_min
+gt_h   = gt_y_max - gt_y_min
 
-**Total loss = classification + bbox + 0.5 × geometric prior**
+prior_loss = L1(pred_h / pred_w, gt_h / gt_w)   # aspect ratio
+           + L1(pred_w, gt_w)                     # width
+```
+
+This approximates the paper's SDFPR, which uses a 3-component GMM fit to clinical data to constrain the deformable sampling offsets inside the backbone. Our version acts at the output level after the fact; the paper's version constrains how features are sampled from the image.
+
+**Total loss:**
+```
+total_loss = cls_loss + bbox_loss + 0.5 × prior_loss
+```
 
 ---
 
-## 6. The Training Pipeline — `train.py`
-
-**What it does:** Runs the training loop that improves the model over 50 epochs.
-
-Key design decisions:
+## 7. Training Pipeline — `train.py`
 
 ### Differential Learning Rates
-The backbone (ResNet-18) was pre-trained on ImageNet and already understands visual features. We train it slowly (`LR_BACKBONE = 1e-5`) to fine-tune gently.
+The ResNet-18 backbone is pre-trained on ImageNet and already understands visual features. Training it too fast would destroy that knowledge. We use:
+- `LR_BACKBONE = 1e-5` for backbone parameters
+- `LR = 1e-4` for the transformer, encoder, decoder, heads, and fusion layers
 
-The transformer and prediction heads are brand new and need to learn from scratch. We train them faster (`LR = 1e-4`).
+This matches the paper's approach and is standard practice for fine-tuning pre-trained vision backbones.
 
 ### Gradient Clipping
-After computing gradients, we clip their magnitude to a maximum of 0.1 before updating weights. This prevents "exploding gradients" — a common instability problem in transformer training where a single bad batch can derail weeks of training.
+After computing gradients, clip their magnitude to `max_norm = 0.1` before the weight update. This prevents a single bad batch from causing a catastrophically large update — a common failure mode in transformer training. The paper uses the same value.
 
 ### Cosine Annealing LR Scheduler
-The learning rate starts at its full value and gradually decreases following a cosine curve down to near-zero by epoch 50. This helps the model settle into a good solution without oscillating at the end.
+Learning rate follows a cosine curve from `1e-4` down to near-zero over 50 epochs. This prevents oscillation near convergence and allows the model to settle into a precise minimum without bouncing.
 
 ### Validation Loop
-After every training epoch, we run the model on the validation set (data it has never trained on) and compute:
-- **Val Loss:** Is the model still improving on unseen data?
-- **Val mIoU:** How well do predicted boxes overlap with ground truth?
+After every training epoch:
+1. Run inference on the validation set (never used for weight updates)
+2. Pick the query with the highest foreground confidence (argmax over benign + malignant probability)
+3. Compute IoU between the predicted box and the ground-truth box
+4. Average IoU across all validation images → **val mIoU**
 
-We save the model only when validation loss improves — this is called **best model checkpointing** and prevents saving an overfit model.
+The model checkpoint is saved whenever validation loss reaches a new minimum. This prevents saving an overfitted model.
 
 ### CSV Logging
-Every epoch's metrics are saved to `logs/training_log.csv` so you can plot training curves later.
+Every epoch's `train_loss`, `val_loss`, and `val_miou` are appended to `logs/training_log.csv`.
 
 ---
 
-## 7. Box Utilities — `utils/box_ops.py`
+## 8. Training Results
 
-Small utility functions used across the project:
+The model was trained for 50 epochs. All results are on the validation set:
 
-- **`compute_iou`:** Given two bounding boxes, computes their Intersection over Union (IoU). A score of 1.0 means perfect overlap; 0.0 means no overlap at all.
-- **`box_xyxy_to_cxcywh`:** Converts box format from corner coordinates `[x_min, y_min, x_max, y_max]` to center format `[cx, cy, width, height]`
+| Epoch | Train Loss | Val Loss | Val mIoU |
+|---|---|---|---|
+| 1 | 2.257 | 1.725 | 0.139 |
+| 15 | 1.728 | 1.567 | 0.210 |
+| 25 | 1.336 | 1.499 | 0.291 |
+| 30 | 1.231 | 1.411 | 0.351 |
+| 41 | 1.082 | 1.457 | **0.374** ← best mIoU |
+| 46 | 1.024 | **1.357** ← best val loss | 0.364 |
+| 50 | 1.024 | 1.369 | 0.363 |
+
+**Key observations:**
+- Training loss decreases steadily and monotonically — gradient clipping is working, no instability
+- Validation mIoU plateaus around epoch 35–41, indicating a capacity ceiling rather than a training failure — the model has learned what its architecture allows
+- The generalisation gap (train ~1.02 vs. val ~1.37 at epoch 50) is moderate and expected for an 800-image dataset
+- The early spike in val loss at epoch 2 (2.096) is normal — the Hungarian matcher takes a few epochs to find stable assignments
+
+The plateau at ~0.37 mIoU is the clearest signal that further training will not help. The next gains require architectural changes: adding GIoU loss, replacing cross-entropy with Focal loss, or implementing the DFI mechanism.
+
+---
+
+## 9. Box Utilities — `utils/box_ops.py`
+
+- **`compute_iou(box1, box2)`:** Computes Intersection over Union for two `[x_min, y_min, x_max, y_max]` boxes. Returns 0.0 for non-overlapping boxes, 1.0 for identical boxes.
+- **`box_xyxy_to_cxcywh`:** Converts `[x_min, y_min, x_max, y_max]` → `[cx, cy, w, h]` (center format, used internally in some loss calculations)
 - **`box_cxcywh_to_xyxy`:** The reverse conversion
 
 ---
 
-## 8. Evaluation — `evaluate.py`
+## 10. Evaluation — `evaluate.py`
 
-**What it does:** After training, measures how good the model actually is on the held-out test set.
+Run on the held-out test set (never seen during training or validation) after training completes.
 
-**For each image:**
-1. Run the model → get 100 predictions
-2. Pick the query with the highest foreground confidence (highest probability of being benign OR malignant)
-3. Compute IoU between the predicted box and the ground-truth box
-4. If IoU ≥ 0.5 AND the class matches → **True Positive (TP)**
-5. If IoU ≥ 0.5 but wrong class → **False Positive for predicted class, False Negative for real class**
-6. If IoU < 0.5 → **False Negative** (missed the nodule)
+**Per image:**
+1. Run model → 100 `(class_logits, bbox)` pairs
+2. Pick the query with the highest `softmax(logits)[benign] + softmax(logits)[malignant]` score
+3. Compute IoU between that predicted box and the ground-truth box
 
-**Output metrics per class:**
-- **IoU:** How well the box overlaps (location quality)
-- **Precision:** Of all detections made, what fraction were correct?
-- **Recall:** Of all real nodules, what fraction did we find?
-- **F1:** Harmonic mean of precision and recall — the overall balance score
+**Classification:**
+- IoU ≥ 0.5 AND correct class → True Positive (TP)
+- IoU ≥ 0.5 AND wrong class → False Positive for predicted class; False Negative for correct class
+- IoU < 0.5 → False Negative (missed detection)
+
+**Output metrics per class (benign, malignant):**
+- **IoU:** Average overlap quality
+- **Precision:** Of all detections predicted as this class, what fraction were correct?
+- **Recall:** Of all ground-truth nodules of this class, what fraction were found?
+- **F1:** Harmonic mean of precision and recall
+
+The paper uses COCO-style AP metrics (area under the precision-recall curve at multiple IoU thresholds), which capture performance across all confidence thresholds simultaneously. Our per-class F1/precision/recall measures performance at a single operating point.
 
 ---
 
-## 9. Inference & Visualization — `inference.py`, `visualize.py`, `utils/visualize.py`
+## 11. Inference & Visualisation — `inference.py`, `visualize.py`, `utils/visualize.py`
 
-**What they do:** Run the trained model on images and draw the results.
-
-`utils/visualize.py` draws two boxes on the image:
-- **Colored box (green = benign, red = malignant):** The model's prediction, with the class name and confidence score
+`utils/visualize.py` draws two overlaid boxes on an image:
+- **Green box (benign) or red box (malignant):** The model's top prediction, with class name and confidence score
 - **Yellow box:** The ground-truth annotation
 
-This lets you visually inspect whether the model is finding nodules in the right place.
+`inference.py` runs this for 20 test images and saves results to `outputs/result_*.png`.
 
-`inference.py` runs this on 20 test images and saves them to the `outputs/` folder.
-
-`visualize.py` runs it on a single image and shows it on screen.
+From visual inspection of the 20 outputs:
+- Classification (benign vs. malignant) is generally correct — class-level features are learnable from grayscale+edge input
+- Localisation is inconsistent — some predictions align well, some miss the nodule entirely
+- Boxes tend to be slightly too large — a consequence of no GIoU loss; L1 alone does not penalise area mismatch
+- Confidence scores are moderate (0.5–0.8) — consistent with a small dataset and no Focal loss for calibration
 
 ---
 
 ## How Everything Connects
 
 ```
-Raw ultrasound image (PNG)
-        ↓
-BUSIDataset
-  - Resize to 256×256
-  - Extract bounding box from mask
-  - Add Sobel edge channel
-  - Apply augmentation (train only)
-        ↓
-DETR Model
-  - ResNet-18 backbone → 4 feature scales
-  - Learned fusion → single feature map
-  - Positional encoding added
-  - Transformer encoder → global context
-  - 100 object queries → transformer decoder
-  - Class head → 100 class scores
-  - Box head → 100 bounding boxes
-        ↓
-Training:
-  - Hungarian matcher assigns 1 query to real nodule
-  - Loss = classification + L1 bbox + geometric prior
-  - Backprop → update weights
-  - Validate every epoch → save best model
-        ↓
-Evaluation:
-  - Load best model
-  - Pick highest-confidence foreground query
-  - Compute IoU, Precision, Recall, F1
+Raw PNG (ultrasound image + segmentation mask)
+            ↓
+    BUSIDataset (datasets/busi.py)
+      - Resize to 256×256
+      - Extract bounding box from mask
+      - Compute Sobel edge channel
+      - Stack → (2, 256, 256) tensor
+      - Augment (train only)
+            ↓
+    DETR Model (models/detr.py)
+      - ResNet-18 → 4 feature maps (64, 128, 256, 512 ch)
+      - Project + resize → all to (256, 64×64)
+      - Concatenate + fusion_conv → (256, 64×64)
+      - Add learned positional encoding
+      - DeformableEncoder (3 layers, K=4 points) → memory (4096, 256)
+      - 100 learned queries + TransformerDecoder (3 layers) → (100, 256)
+      - class_embed → (100, 3) logits
+      - bbox_embed  → (100, 4) normalised boxes
+            ↓
+    Training (train.py)
+      - HungarianMatcher: assign 1 query to GT, 99 → no-object
+      - Loss = cross-entropy + L1 + 0.5 × geometric prior
+      - Backprop + gradient clip (0.1) + AdamW
+      - Cosine annealing LR schedule
+      - Validate every epoch → save best model
+            ↓
+    Evaluation (evaluate.py)
+      - Load best checkpoint
+      - Pick highest-foreground-confidence query per image
+      - Compute IoU, Precision, Recall, F1 per class
+            ↓
+    Inference (inference.py / visualize.py)
+      - Draw predicted box + class + confidence
+      - Draw ground-truth box in yellow
+      - Save to outputs/
 ```
 
 ---
 
-## Key Terms Glossary
+## Key Terms
 
 | Term | Plain English |
 |---|---|
-| **Bounding Box** | A rectangle drawn around the nodule |
-| **Anchor-free detection** | Predicting boxes directly without pre-defined reference boxes |
-| **Hungarian Matching** | An algorithm that finds the optimal one-to-one assignment between predictions and ground truths |
-| **IoU (Intersection over Union)** | How much two boxes overlap, as a fraction (0 = no overlap, 1 = perfect match) |
-| **Epoch** | One complete pass through the entire training dataset |
-| **Gradient Clipping** | Capping gradient values to prevent training instability |
-| **Class Imbalance** | When one class (no-object) is much more common than others (benign, malignant), causing the model to ignore the rare classes |
-| **Precision** | Of the boxes the model drew, how many were actually nodules? |
-| **Recall** | Of all real nodules in the images, how many did the model find? |
-| **Validation Set** | A separate set of images used to check model performance during training — never used for weight updates |
-| **Checkpointing** | Saving the model only when it improves, so you keep the best version |
-| **Stratified Split** | Dividing data so each split has a proportional representation of every class |
+| **Bounding box** | A rectangle drawn around the nodule |
+| **Anchor-free detection** | Predicting boxes directly, without scanning pre-defined reference boxes |
+| **Hungarian matching** | An algorithm that finds the optimal one-to-one pairing between predictions and ground truths |
+| **IoU (Intersection over Union)** | How much two boxes overlap, as a fraction (0 = no overlap, 1 = perfect) |
+| **Deformable attention** | Attention that samples K learned positions rather than attending to all N positions — O(N·K) instead of O(N²) |
+| **Epoch** | One complete pass through the training dataset |
+| **Gradient clipping** | Capping gradient magnitudes to prevent training instability |
+| **Class imbalance** | No-object queries greatly outnumber real-object queries (99:1), causing the model to ignore real nodules without correction |
+| **Focal loss** | A loss function that down-weights easy (confident) examples and focuses on hard ones — paper uses this; we use weighted cross-entropy instead |
+| **GIoU (Generalised IoU)** | A box regression loss that directly penalises non-overlapping area — paper uses this; we use L1 + geometric prior instead |
+| **DFI** | Dense Feature Interaction — the paper's mechanism for feeding all encoder layer outputs to the decoder; not implemented here |
+| **SDFPR** | The paper's GMM-based Prior DCN — constrains deformable sampling offsets in the backbone to respect clinical nodule shape statistics |
+| **MSFFM** | The paper's dual-branch spatial-frequency mixer — spatial branch for contour priors, FFT branch for speckle suppression |
+| **AP@0.5** | Average Precision at IoU threshold 0.5 — area under the precision-recall curve; the paper's primary metric |
+| **mIoU** | Mean IoU of the top-1 prediction per image; our primary validation metric |
+| **Stratified split** | Data division that preserves class proportions in every subset |
+| **Checkpointing** | Saving model weights only when performance improves, keeping the best version |

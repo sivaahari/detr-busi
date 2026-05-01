@@ -40,6 +40,7 @@ NHEAD         = 8
 ENC_LAYERS    = 3
 DEC_LAYERS    = 3
 DIM_FFN       = 512
+N_POINTS      = 4       # sampling points per head in deformable attention
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 EPOCHS        = 50
