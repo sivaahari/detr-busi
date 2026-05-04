@@ -4,14 +4,45 @@ from utils.matcher import HungarianMatcher
 import configs.config as cfg
 
 
+def dice_loss(pred, target, smooth=1e-6):
+    """
+    Compute Dice loss for multi-class segmentation.
+    pred: (B, C, H, W) logits
+    target: (B, H, W) class indices
+    """
+    num_classes = pred.shape[1]
+    device = pred.device
+    
+    # Convert target to one-hot
+    target_one_hot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+    
+    # Softmax predictions
+    pred_soft = torch.softmax(pred, dim=1)
+    
+    # Compute Dice per class
+    dice_scores = []
+    for c in range(num_classes):
+        pred_c = pred_soft[:, c]
+        target_c = target_one_hot[:, c]
+        
+        intersection = (pred_c * target_c).sum(dim=(1, 2))
+        union = pred_c.sum(dim=(1, 2)) + target_c.sum(dim=(1, 2))
+        
+        dice = (2. * intersection + smooth) / (union + smooth)
+        dice_scores.append(dice.mean())
+    
+    return 1 - torch.stack(dice_scores).mean()
+
+
 class DETRLoss:
-    def __init__(self):
+    def __init__(self, use_segmentation=False):
         self.matcher = HungarianMatcher(
             class_weight=cfg.COST_CLASS,
             bbox_weight=cfg.COST_BBOX,
         )
+        self.use_segmentation = use_segmentation
 
-    def loss(self, pred_logits, pred_boxes, targets):
+    def loss(self, pred_logits, pred_boxes, targets, pred_seg=None):
         batch_size = pred_logits.shape[0]
         device = pred_logits.device
 
@@ -30,9 +61,10 @@ class DETRLoss:
             cls_weight = torch.ones(num_classes, device=device)
             cls_weight[no_obj_idx] = cfg.NO_OBJ_WEIGHT
 
+            # targets: (image, mask, bbox, label)
             target = {
-                "labels": targets[i][1].unsqueeze(0),
-                "boxes":  targets[i][0].unsqueeze(0),
+                "labels": targets[i][3].unsqueeze(0),
+                "boxes":  targets[i][2].unsqueeze(0),
             }
 
             idx_pred, idx_tgt = self.matcher.match(logits, boxes, target)
@@ -66,9 +98,33 @@ class DETRLoss:
             total_bbox_loss  += bbox_loss
             total_prior_loss += prior_loss
 
-        total_loss = (
+        detection_loss = (
             total_cls_loss
             + total_bbox_loss
             + cfg.PRIOR_LOSS_WEIGHT * total_prior_loss
         )
-        return total_loss
+        
+        # ── segmentation loss ───────────────────────────────────────────────
+        seg_loss = 0.0
+        if self.use_segmentation and pred_seg is not None:
+            for i in range(batch_size):
+                # targets[i][1] is the mask (H, W) with class indices
+                seg_pred = pred_seg[i]  # (C, H, W)
+                seg_target = targets[i][1].long()  # (H, W)
+                
+                # BCE loss
+                bce_loss = F.cross_entropy(seg_pred, seg_target, weight=torch.tensor([1.0, 1.0, 0.5], device=device))
+                
+                # Dice loss
+                d_loss = dice_loss(seg_pred.unsqueeze(0), seg_target.unsqueeze(0))
+                
+                seg_loss += (bce_loss + d_loss)
+            
+            seg_loss = seg_loss / batch_size
+        
+        # Combine losses
+        if self.use_segmentation and pred_seg is not None:
+            total_loss = detection_loss + cfg.SEG_LOSS_WEIGHT * seg_loss
+            return total_loss, detection_loss, seg_loss
+        
+        return detection_loss

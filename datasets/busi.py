@@ -83,8 +83,12 @@ class BUSIDataset(Dataset):
 
         image = np.stack([image, edges], axis=0)
 
+        # Normalize mask to [0, 1] binary
+        mask_binary = (mask > 0).astype(np.float32)
+
         return (
             torch.tensor(image, dtype=torch.float32),
+            torch.tensor(mask_binary, dtype=torch.float32),
             torch.tensor(bbox,  dtype=torch.float32),
             torch.tensor(label, dtype=torch.long),
         )

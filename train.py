@@ -16,16 +16,22 @@ import configs.config as cfg
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
+    total_det_loss = 0.0
+    total_seg_loss = 0.0
 
     loop = tqdm(loader, desc="  train", leave=False)
-    for images, bboxes, labels in loop:
-        images = images.to(device)
-        bboxes = bboxes.to(device)
-        labels = labels.to(device)
+    for batch in loop:
+        images = batch[0].to(device)
+        masks = batch[1].to(device)
+        bboxes = batch[2].to(device)
+        labels = batch[3].to(device)
 
-        logits, boxes = model(images)
-        targets = [(bboxes[i], labels[i]) for i in range(len(images))]
-        loss = criterion.loss(logits, boxes, targets)
+        logits, boxes, seg_mask = model(images)
+        
+        # Create targets tuple: (image, mask, bbox, label) for each sample
+        targets = [(images[i], masks[i], bboxes[i], labels[i]) for i in range(len(images))]
+        
+        loss, det_loss, seg_loss = criterion.loss(logits, boxes, targets, seg_mask)
 
         optimizer.zero_grad()
         loss.backward()
@@ -33,9 +39,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         optimizer.step()
 
         total_loss += loss.item()
+        total_det_loss += det_loss.item()
+        total_seg_loss += seg_loss.item()
         loop.set_postfix(loss=f"{loss.item():.4f}")
 
-    return total_loss / len(loader)
+    return total_loss / len(loader), total_det_loss / len(loader), total_seg_loss / len(loader)
 
 
 # ─── validation epoch ─────────────────────────────────────────────────────────
@@ -43,19 +51,25 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 def validate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
+    total_det_loss = 0.0
+    total_seg_loss = 0.0
     total_iou  = 0.0
     n = 0
 
     with torch.no_grad():
-        for images, bboxes, labels in loader:
-            images = images.to(device)
-            bboxes = bboxes.to(device)
-            labels = labels.to(device)
+        for batch in loader:
+            images = batch[0].to(device)
+            masks = batch[1].to(device)
+            bboxes = batch[2].to(device)
+            labels = batch[3].to(device)
 
-            logits, boxes = model(images)
-            targets = [(bboxes[i], labels[i]) for i in range(len(images))]
-            loss = criterion.loss(logits, boxes, targets)
+            logits, boxes, seg_mask = model(images)
+            
+            targets = [(images[i], masks[i], bboxes[i], labels[i]) for i in range(len(images))]
+            loss, det_loss, seg_loss = criterion.loss(logits, boxes, targets, seg_mask)
             total_loss += loss.item()
+            total_det_loss += det_loss.item()
+            total_seg_loss += seg_loss.item()
 
             for i in range(len(images)):
                 probs    = torch.softmax(logits[i], dim=-1)
@@ -67,7 +81,7 @@ def validate(model, loader, criterion, device):
                 total_iou += compute_iou(pred_box, gt_box)
                 n += 1
 
-    return total_loss / len(loader), total_iou / max(n, 1)
+    return total_loss / len(loader), total_det_loss / len(loader), total_seg_loss / len(loader), total_iou / max(n, 1)
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -89,8 +103,8 @@ def train():
     )
 
     # ── model / loss / optimizer ───────────────────────────────────────────────
-    model     = DETR(num_classes=cfg.NUM_CLASSES, num_queries=cfg.NUM_QUERIES).to(device)
-    criterion = DETRLoss()
+    model     = DETR(num_classes=cfg.NUM_CLASSES, num_queries=cfg.NUM_QUERIES, use_segmentation=True).to(device)
+    criterion = DETRLoss(use_segmentation=True)
 
     # Backbone (pre-trained ResNet layers + projections) gets 10x lower LR than
     # the transformer + heads which are trained from scratch.
@@ -119,20 +133,20 @@ def train():
 
     log_file = open(cfg.LOG_PATH, "w", newline="")
     writer   = csv.writer(log_file)
-    writer.writerow(["epoch", "train_loss", "val_loss", "val_miou"])
+    writer.writerow(["epoch", "train_loss", "train_det_loss", "train_seg_loss", "val_loss", "val_det_loss", "val_seg_loss", "val_miou"])
 
     best_val_loss = float("inf")
 
-    print(f"{'Epoch':>6}  {'Train Loss':>12}  {'Val Loss':>10}  {'Val mIoU':>10}")
-    print("-" * 46)
+    print(f"{'Epoch':>6}  {'Train Loss':>12}  {'Det Loss':>12}  {'Seg Loss':>12}  {'Val Loss':>10}  {'Val mIoU':>10}")
+    print("-" * 82)
 
     for epoch in range(1, cfg.EPOCHS + 1):
-        train_loss         = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_miou = validate(model, val_loader, criterion, device)
+        train_loss, train_det_loss, train_seg_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_det_loss, val_seg_loss, val_miou = validate(model, val_loader, criterion, device)
         scheduler.step()
 
-        print(f"{epoch:>6}  {train_loss:>12.4f}  {val_loss:>10.4f}  {val_miou:>10.4f}")
-        writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_miou:.6f}"])
+        print(f"{epoch:>6}  {train_loss:>12.4f}  {train_det_loss:>12.4f}  {train_seg_loss:>12.4f}  {val_loss:>10.4f}  {val_miou:>10.4f}")
+        writer.writerow([epoch, f"{train_loss:.6f}", f"{train_det_loss:.6f}", f"{train_seg_loss:.6f}", f"{val_loss:.6f}", f"{val_det_loss:.6f}", f"{val_seg_loss:.6f}", f"{val_miou:.6f}"])
         log_file.flush()
 
         if val_loss < best_val_loss:

@@ -53,6 +53,7 @@ GRAD_CLIP     = 0.1     # max_norm for gradient clipping (standard for DETR)
 # ─── Loss ─────────────────────────────────────────────────────────────────────
 NO_OBJ_WEIGHT     = 0.1   # down-weight the 99 no-object queries vs 1 real object
 PRIOR_LOSS_WEIGHT = 0.5   # geometric prior loss coefficient
+SEG_LOSS_WEIGHT   = 1.0   # segmentation loss weight (equal to detection)
 
 # ─── Matcher ──────────────────────────────────────────────────────────────────
 COST_CLASS    = 1.0

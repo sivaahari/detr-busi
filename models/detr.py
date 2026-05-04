@@ -5,11 +5,14 @@ import torchvision.models as models
 
 import configs.config as cfg
 from models.deformable_attention import DeformableEncoder
+from models.segmentation_head import SegmentationHead
 
 
 class DETR(nn.Module):
-    def __init__(self, num_classes=3, num_queries=100):
+    def __init__(self, num_classes=3, num_queries=100, use_segmentation=True):
         super().__init__()
+        
+        self.use_segmentation = use_segmentation
 
         # ---------------- Backbone ----------------
         backbone = models.resnet18(weights="DEFAULT")
@@ -41,6 +44,14 @@ class DETR(nn.Module):
 
         # learned fusion: concat 4 scale features → single hidden_dim map
         self.fusion_conv = nn.Conv2d(hidden_dim * 4, hidden_dim, kernel_size=1)
+        
+        # ---------------- Segmentation Head ----------------
+        if self.use_segmentation:
+            self.seg_head = SegmentationHead(
+                in_channels_list=[64, 128, 256, 512],
+                hidden_dim=hidden_dim,
+                num_classes=num_classes
+            )
 
         # ---------------- Positional Encoding ----------------
         self.row_embed = nn.Embedding(256, hidden_dim // 2)
@@ -80,16 +91,19 @@ class DETR(nn.Module):
     def forward(self, x):
         # ---------------- Multi-scale feature extraction ----------------
         x = self.layer1(x)
-        f1 = x  # low-level features
+        f1 = x  # low-level features (64, 64x64)
 
         x = self.layer2(x)
-        f2 = x
+        f2 = x  # (128, 32x32)
 
         x = self.layer3(x)
-        f3 = x
+        f3 = x  # (256, 16x16)
 
         x = self.layer4(x)
-        f4 = x  # high-level features
+        f4 = x  # high-level features (512, 8x8)
+        
+        # Store backbone features for segmentation
+        backbone_features = [f1, f2, f3, f4] if self.use_segmentation else None
 
         # ---------------- Project to common dimension ----------------
         f1 = self.input_proj1(f1)
@@ -149,4 +163,11 @@ class DETR(nn.Module):
         class_logits = self.class_embed(hs)
         bbox         = self.bbox_embed(hs)
 
+        # ---------------- Segmentation ----------------
+        seg_mask = None
+        if self.use_segmentation and backbone_features is not None:
+            seg_mask = self.seg_head(backbone_features)  # (B, num_classes, H, W)
+        
+        if self.use_segmentation:
+            return class_logits, bbox, seg_mask
         return class_logits, bbox
