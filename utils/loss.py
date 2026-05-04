@@ -113,7 +113,7 @@ class DETRLoss:
                 seg_target = targets[i][1].long().unsqueeze(0)  # (1, H, W)
                 
                 # Resize prediction to match target size
-                seg_pred = F.interpolate(seg_pred, size=seg_target.shape[2:], 
+                seg_pred = F.interpolate(seg_pred, size=(seg_target.shape[1], seg_target.shape[2]), 
                                         mode='bilinear', align_corners=False)
                 
                 # BCE loss (without weight, handle class imbalance via Dice)
