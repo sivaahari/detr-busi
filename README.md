@@ -158,6 +158,21 @@ Input Ultrasound Image (256 × 256)
 | 25 | 1.82 | 1.32 | 0.50 | 0.32 |
 | 50 | 1.40 | 0.95 | 0.45 | 0.42 |
 
+### Sample Results
+
+The model produces both detection (bounding box + class) and segmentation (pixel-level mask) outputs:
+
+| Detection Results | Segmentation Results |
+|:---:|:---:|
+| ![Detection 1](samples/detection_result_1.png) | ![Segmentation 1](samples/segmentation_result_1.png) |
+| ![Detection 2](samples/detection_result_2.png) | ![Segmentation 2](samples/segmentation_result_2.png) |
+| Combined View | |
+| ![Combined](samples/combined_result.png) | |
+
+Each output image shows:
+- **Left side**: Detection with bounding boxes (green=benign, red=malignant, yellow=ground truth)
+- **Right side**: Segmentation overlay (green=benign, red=malignant, gray=background)
+
 ---
 
 ## Installation
