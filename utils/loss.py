@@ -109,14 +109,14 @@ class DETRLoss:
         if self.use_segmentation and pred_seg is not None:
             for i in range(batch_size):
                 # targets[i][1] is the mask (H, W) with class indices
-                seg_pred = pred_seg[i]  # (C, H, W)
-                seg_target = targets[i][1].long()  # (H, W)
+                seg_pred = pred_seg[i].unsqueeze(0)  # (1, C, H, W)
+                seg_target = targets[i][1].long().unsqueeze(0)  # (1, H, W)
                 
-                # BCE loss
-                bce_loss = F.cross_entropy(seg_pred, seg_target, weight=torch.tensor([1.0, 1.0, 0.5], device=device))
+                # BCE loss (without weight, handle class imbalance via Dice)
+                bce_loss = F.cross_entropy(seg_pred, seg_target)
                 
                 # Dice loss
-                d_loss = dice_loss(seg_pred.unsqueeze(0), seg_target.unsqueeze(0))
+                d_loss = dice_loss(seg_pred, seg_target)
                 
                 seg_loss += (bce_loss + d_loss)
             
