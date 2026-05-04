@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn.functional as F
 import cv2
 import numpy as np
 from datasets.busi import BUSIDataset
@@ -28,6 +29,10 @@ def run_inference(split: str = "test", num_samples: int = 10):
 
         with torch.no_grad():
             logits, boxes, seg_mask = model(image.unsqueeze(0).to(device))
+        
+        # Resize segmentation to match image size
+        seg_mask = F.interpolate(seg_mask, size=(image.shape[1], image.shape[2]), 
+                                 mode='bilinear', align_corners=False)
 
         # Visualize detection
         det_output = visualize_prediction(image, logits[0], boxes[0], gt_bbox)
